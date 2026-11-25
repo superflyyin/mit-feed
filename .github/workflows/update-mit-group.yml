@@ -1,0 +1,159 @@
+name: update-mit-group
+
+# Keep ONE #genre# group of fleung49/star/mit in sync with upstream.
+# Deploy: copy this file to <your-repo>/.github/workflows/update-mit-group.yml
+#   1) repo must be PUBLIC if you want to subscribe by URL
+#   2) Settings -> Actions -> General -> Workflow permissions: Read and write permissions
+#   3) Actions -> update-mit-group -> Run workflow (once)
+# Then subscribe your app to:
+#   https://raw.githubusercontent.com/<user>/<repo>/main/feed/63.141gslb.txt
+#   https://cdn.jsdelivr.net/gh/<user>/<repo>@main/feed/63.141gslb.txt   (CDN mirror)
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      match:
+        description: "keyword that must appear in the group header"
+        required: false
+        default: "63.141"
+      min_channels:
+        description: "abort below this channel count (upstream looks truncated)"
+        required: false
+        default: "100"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-mit-group
+  cancel-in-progress: true
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Fetch upstream mit (proxy fallback)
+        run: |
+          set -uo pipefail
+          URLS="https://raw.githubusercontent.com/fleung49/star/refs/heads/main/mit
+          https://v4.gh-proxy.org/https://raw.githubusercontent.com/fleung49/star/refs/heads/main/mit
+          https://gh-proxy.org/https://raw.githubusercontent.com/fleung49/star/refs/heads/main/mit
+          https://ghfast.top/https://raw.githubusercontent.com/fleung49/star/refs/heads/main/mit
+          https://github.moeyy.xyz/https://raw.githubusercontent.com/fleung49/star/refs/heads/main/mit
+          https://cdn.jsdelivr.net/gh/fleung49/star@main/mit"
+          ok=0
+          while IFS= read -r u; do
+            [ -z "$u" ] && continue
+            echo "== try $u"
+            if curl -fsSL --retry 2 --max-time 150 -H 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)' -o mit.raw "$u"; then
+              size=$(wc -c < mit.raw | tr -d ' ')
+              if [ "$size" -gt 2000 ] && grep -q '#genre#' mit.raw; then
+                echo "== ok: $size bytes"
+                ok=1
+                break
+              fi
+              echo "== rejected: size=$size (no #genre# marker)"
+            fi
+          done <<< "$URLS"
+          if [ "$ok" != "1" ]; then echo "!! every source failed"; exit 1; fi
+
+      - name: Extract one group
+        env:
+          MATCH: ${{ github.event.inputs.match || '63.141' }}
+          MIN_CHANNELS: ${{ github.event.inputs.min_channels || '100' }}
+          OUT_NAME: "63.141gslb"
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, sys
+
+          match = os.environ["MATCH"]
+          min_ch = int(os.environ["MIN_CHANNELS"])
+          out_name = os.environ["OUT_NAME"]
+
+          text = pathlib.Path("mit.raw").read_text(encoding="utf-8", errors="replace")
+          lines = text.splitlines()
+
+          idx = None
+          for i, line in enumerate(lines):
+              if "#genre#" in line and match in line:
+                  idx = i
+                  break
+          if idx is None:
+              sys.exit("header containing %r not found" % match)
+
+          header = lines[idx].strip()
+          group = header.split(",")[0].strip() or header.replace("#genre#", "").strip()
+
+          entries, seen = [], set()
+          raw = dup = bad = renamed = 0
+          for line in lines[idx + 1:]:
+              t = line.strip()
+              if not t:
+                  continue
+              if "#genre#" in t:
+                  break
+              name, sep, rest = t.partition(",")
+              name, rest = name.strip(), rest.strip()
+              if not sep or not name or not rest:
+                  bad += 1
+                  continue
+              raw += 1
+              # upstream typo: CCTB... -> CCTV...
+              if name.startswith("CCTB"):
+                  name = "CCTV" + name[4:]
+                  renamed += 1
+              for url in rest.split("#"):
+                  url = url.strip()
+                  if not url:
+                      continue
+                  if not url.lower().startswith(("http://", "https://", "rtmp", "rtsp://", "udp://", "rtp://")):
+                      bad += 1
+                      continue
+                  key = (name, url)
+                  if key in seen:
+                      dup += 1
+                      continue
+                  seen.add(key)
+                  entries.append((name, url))
+
+          print("group=%r raw=%d kept=%d dup=%d skipped=%d renamed=%d" % (group, raw, len(entries), dup, bad, renamed))
+          if not entries:
+              sys.exit("no usable channel in group, nothing written")
+          if len(entries) < min_ch:
+              sys.exit("only %d channels < %d; upstream looks truncated, keep old feed" % (len(entries), min_ch))
+
+          out = pathlib.Path("feed")
+          out.mkdir(exist_ok=True)
+
+          txt = [group + ",#genre#"]
+          m3u = ["#EXTM3U"]
+          for name, url in entries:
+              txt.append(name + "," + url)
+              m3u.append('#EXTINF:-1 group-title="' + group + '",' + name)
+              m3u.append(url)
+
+          (out / (out_name + ".txt")).write_text("\n".join(txt) + "\n", encoding="utf-8")
+          (out / (out_name + ".m3u")).write_text("\n".join(m3u) + "\n", encoding="utf-8")
+          print("wrote feed/%s.txt and feed/%s.m3u with %d channels" % (out_name, out_name, len(entries)))
+          PY
+
+      - name: Cleanup temp file
+        if: always()
+        run: rm -f mit.raw
+
+      - name: Commit when changed
+        run: |
+          git config user.name "mit-feed-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add -A feed
+          if git diff --cached --quiet; then
+            echo "feed unchanged, nothing to commit"
+            exit 0
+          fi
+          git commit -m "feed: refresh $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          git push
